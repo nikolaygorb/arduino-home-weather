@@ -6,8 +6,8 @@
 
 #include <ESP8266WiFi.h>
 #include <SPI.h>
-#include <TFT_eSPI.h>    // Graphics library
-#include <ArduinoJson.h> // JSON Parsing
+#include <TFT_eSPI.h>
+#include <ArduinoJson.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #include <ESP8266HTTPClient.h>
@@ -753,7 +753,7 @@ void getGeoLocation()
         const char *city_name = doc["city"] | "";
 
         // If IP geolocation returned latitude/longitude, copy them into active buffers
-            if (doc.containsKey("lat") && doc.containsKey("lon"))
+        if (doc.containsKey("lat") && doc.containsKey("lon"))
         {
           float latf = doc["lat"] | 0.0;
           float lonf = doc["lon"] | 0.0;
@@ -782,7 +782,7 @@ void getGeoLocation()
           location_str[sizeof(location_str) - 1] = '\0';
         }
 
-            Serial.printf("Geo OK: %s\n", location_str);
+        Serial.printf("Geo OK: %s\n", location_str);
       }
       else
       {
