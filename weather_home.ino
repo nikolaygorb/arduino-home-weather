@@ -45,11 +45,7 @@ WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "europe.pool.ntp.org", 0, 60000);
 
 unsigned long lastWeatherUpdate = 0;
-unsigned long weatherInterval = 900000; // Update weather every 15 minutes (900000 ms)
-unsigned long lastCycle = 0;
-const unsigned long cycleMs = 900000; // 15 minutes
-const unsigned long sleepMs = 840000; // 14 minutes (Wi‑Fi off)
-bool sleepingRadio = false;
+const unsigned long weatherInterval = 900000; // Update weather every 15 minutes
 char location_str[64] = "Unknown";
 
 // NTP synchronization
@@ -66,7 +62,6 @@ float last_wind_speed = -999.0;
 int last_wind_deg = -1;
 char last_weather_main[32] = "";
 char last_weather_desc[64] = "";
-bool firstDraw = true;
 
 // Variables to store data
 float temp_c = 0;
@@ -99,8 +94,9 @@ char overlayMessage[32] = "";
 // Brightness control
 uint8_t brightnessLevels[] = {2, 10, 15, 25, 30, 60};
 uint8_t currentBrightnessIndex = 4; // Start at 30%
-bool manualBrightnessSet = false;
-unsigned long lastBrightness = 0;
+const uint8_t BRIGHTNESS_NIGHT = 2;
+const uint8_t BRIGHTNESS_DAY = 30;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
 
 void setBacklightPercent(uint8_t pct)
 {
@@ -109,15 +105,58 @@ void setBacklightPercent(uint8_t pct)
   analogWrite(BACKLIGHT_PIN, pwm);
 }
 
+// NTP has never landed if the epoch is still counting up from zero.
+bool timeIsValid()
+{
+  return timeClient.getEpochTime() > 1000000;
+}
+
+// The radio dominates consumption, so it is only powered for the seconds we need it.
+bool radioEnable()
+{
+  if (WiFi.status() == WL_CONNECTED)
+    return true;
+
+  WiFi.forceSleepWake();
+  delay(1);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_ssid, wifi_password);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_CONNECT_TIMEOUT_MS)
+  {
+    delay(200);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("WiFi connect failed");
+    return false;
+  }
+
+  // Only takes effect once the station is associated.
+  WiFi.setSleepMode(WIFI_MODEM_SLEEP);
+  timeClient.begin();
+  return true;
+}
+
+void radioDisable()
+{
+  // The UDP socket does not survive the interface going down; re-opened by radioEnable().
+  timeClient.end();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  WiFi.forceSleepBegin();
+  delay(1);
+}
+
 void setup()
 {
   Serial.begin(115200);
 
   // Lower CPU frequency to save power
   system_update_cpu_freq(80); // 80 MHz instead of 160 MHz (approx -30% power)
-
-  // Wi‑Fi power saving mode
-  WiFi.setSleepMode(WIFI_MODEM_SLEEP);
 
   // Configure FLASH button
   pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -142,15 +181,7 @@ void setup()
   tft.println(wifi_ssid);
 
   // Connect to WiFi (20s timeout)
-  WiFi.begin(wifi_ssid, wifi_password);
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart) < 20000)
-  {
-    delay(200);
-    Serial.print(".");
-    tft.print(".");
-  }
-  if (WiFi.status() == WL_CONNECTED)
+  if (radioEnable())
   {
     tft.fillScreen(TFT_BLACK);
     tft.setCursor(10, 20);
@@ -203,8 +234,6 @@ void setup()
   // Otherwise continue without showing an intermediate screen
 
   // Initialize time
-  timeClient.begin();
-
   // Wait for time synchronization
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(10, 100);
@@ -213,23 +242,14 @@ void setup()
   tft.println("Syncing Time...");
 
   unsigned long timeoutStart = millis();
-  bool timeSync = false;
-  while (!timeSync && (millis() - timeoutStart < 10000))
+  while (!timeIsValid() && (millis() - timeoutStart < 10000))
   {
-    timeSync = timeClient.update();
-    if (!timeSync)
-    {
-      delay(200);
-      tft.print(".");
-    }
-    // Verify that time is actually synchronized
-    if (timeClient.getEpochTime() > 1000000)
-    {
-      timeSync = true;
-    }
+    timeClient.update();
+    delay(200);
+    tft.print(".");
   }
 
-  if (!timeSync)
+  if (!timeIsValid())
   {
     tft.fillScreen(TFT_BLACK);
     tft.setCursor(10, 100);
@@ -270,6 +290,10 @@ void setup()
     delay(3000);
   }
 
+  radioDisable();
+  lastWeatherUpdate = millis();
+  lastNTPSync = millis();
+
   tft.fillScreen(TFT_BLACK);
   drawInterface();
 }
@@ -278,39 +302,38 @@ void loop()
 {
   unsigned long now = millis();
 
-  // Update time at the start of loop for smoothness
-  timeClient.update();
-
-  // Handle FLASH button
   handleButton();
-
-  // NTP sync once per day
-  if (now - lastNTPSync >= ntpSyncInterval || lastNTPSync == 0)
-  {
-    if (WiFi.status() == WL_CONNECTED || !sleepingRadio)
-    {
-      timeClient.update();
-      lastNTPSync = now;
-      Serial.println("NTP synced");
-    }
-  }
-
-  // Update time display only when the minute changes
   updateTimeDisplay();
+  updateBacklightMode();
 
-  // Night backlight mode (23:00 - 07:00 -> 2%) - only if brightness is not set manually
-  if (!manualBrightnessSet)
+  bool weatherDue = (now - lastWeatherUpdate >= weatherInterval);
+  // Until the clock is set, retry NTP at the short interval instead of waiting a day.
+  bool ntpDue = (now - lastNTPSync >= (timeIsValid() ? ntpSyncInterval : weatherInterval));
+
+  // All network work is batched into a single radio window per interval.
+  if (weatherDue || ntpDue)
   {
-    updateBacklightMode();
+    if (radioEnable())
+    {
+      if (ntpDue)
+        timeClient.forceUpdate();
+      if (weatherDue)
+      {
+        getWeatherData();
+        updateWeatherDisplay();
+      }
+    }
+    radioDisable();
+
+    // Timestamps advance even on failure so a dead link is not retried every loop.
+    if (weatherDue)
+      lastWeatherUpdate = now;
+    if (ntpDue)
+      lastNTPSync = now;
   }
 
-  // Update weather every 15 minutes
-  if (now - lastWeatherUpdate >= weatherInterval)
-  {
-    getWeatherData();
-    updateWeatherDisplay();
-    lastWeatherUpdate = now;
-  }
+  // Without an idle window the SDK never enters modem sleep.
+  delay(20);
 }
 
 // --- WEATHER FETCH FUNCTION ---
@@ -359,12 +382,11 @@ void getWeatherData()
         dataValid = true;
 
         // Adjust time using offset from API (auto-detect timezone)
+        // setTimeOffset applies immediately to getEpochTime(); no NTP round-trip needed.
         timeClient.setTimeOffset(timezone_offset);
-        // Update time client immediately to reflect new offset
-        timeClient.update();
 
         // Save the time of the last successful update (only if time is synchronized)
-        if (timeClient.getEpochTime() > 1000000)
+        if (timeIsValid())
         {
           int hh = timeClient.getHours();
           int mm = timeClient.getMinutes();
@@ -409,12 +431,10 @@ void drawWindArrow(int cx, int cy, int deg, int size, bool showTrajectory)
   // Choose angle
   float angle_deg = showTrajectory ? deg + 180 : deg;
 
-  // Convert to radians (Y-axis inverted for TFT)
-  float angle = -angle_deg * PI / 180.0;
-
-  // Arrow end point
-  float dx = cos(angle);
-  float dy = sin(angle);
+  // Compass 0 deg is North (up) and the screen Y axis grows downward.
+  float angle = angle_deg * PI / 180.0;
+  float dx = sin(angle);
+  float dy = -cos(angle);
   int x2 = cx + int(dx * size);
   int y2 = cy + int(dy * size);
 
@@ -467,14 +487,6 @@ void updateWeatherDisplay()
   if (!dataValid)
     return;
 
-  // First draw - render everything
-  if (firstDraw)
-  {
-    drawInterface();
-    firstDraw = false;
-    return;
-  }
-
   // Conversions for comparison
   int pressure_mmhg = pressure_hpa * 0.75006;
   float wind_kmh = wind_speed_ms * 3.6;
@@ -482,12 +494,12 @@ void updateWeatherDisplay()
   // === TEMPERATURE ===
   if (abs(temp_c - last_temp) > 0.1)
   {
-    tft.fillRect(10, 100, 180, 40, TFT_BLACK);
+    // 190px is all the room there is before the feels-like column at x=200.
+    tft.fillRect(10, 100, 190, 40, TFT_BLACK);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
     tft.setTextSize(5);
     tft.setCursor(10, 100);
-    tft.print(temp_c, 1);
-    tft.print(" C");
+    tft.printf("%.1fC", temp_c);
     last_temp = temp_c;
     Serial.println("Temp updated");
   }
@@ -607,8 +619,7 @@ void drawInterface()
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   tft.setTextSize(5); // Large font
   tft.setCursor(10, 100);
-  tft.print(temp_c, 1);
-  tft.print(" C");
+  tft.printf("%.1fC", temp_c);
 
   // -- Details (bottom) --
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
@@ -814,7 +825,7 @@ void updateTimeDisplay()
   snprintf(currentTimeBuf, sizeof(currentTimeBuf), "%02d:%02d", hh, mm);
 
   // Update only if the minute changed
-  if (strcmp(currentTimeBuf, last_time) != 0 || firstDraw)
+  if (strcmp(currentTimeBuf, last_time) != 0)
   {
     // Draw text with background to overwrite old characters without flicker
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
@@ -833,34 +844,18 @@ void updateTimeDisplay()
 // Backlight brightness control based on time of day
 void updateBacklightMode()
 {
-  static uint8_t lastBrightness = 0;
-  uint8_t targetBrightness;
+  static uint8_t lastTarget = 0;
 
   int hour = timeClient.getHours();
+  uint8_t targetBrightness = (hour >= 23 || hour < 7) ? BRIGHTNESS_NIGHT : BRIGHTNESS_DAY;
 
-  // Night mode: 23:00 - 07:00 -> 2%
-  if (hour >= 23 || hour < 7)
-  {
-    targetBrightness = 2;
-  }
-  else
-  {
-    targetBrightness = 30;
-  }
+  if (targetBrightness == lastTarget)
+    return;
 
-  // Reset manual brightness when day/night mode changes
-  if (targetBrightness != lastBrightness && lastBrightness != 0)
-  {
-    manualBrightnessSet = false;
-  }
-
-  // Update only if changed
-  if (targetBrightness != lastBrightness)
-  {
-    setBacklightPercent(targetBrightness);
-    lastBrightness = targetBrightness;
-    Serial.printf("Backlight: %d%%\n", targetBrightness);
-  }
+  lastTarget = targetBrightness;
+  // Crossing the day/night boundary overrides any manual level set via the button.
+  setBacklightPercent(targetBrightness);
+  Serial.printf("Backlight: %d%%\n", targetBrightness);
 }
 
 // --- ENHANCED WEATHER ICONS ---
@@ -1015,8 +1010,9 @@ void handleButton()
   // Clear overlay on timeout (1.5 seconds)
   if (overlayActive && (now - overlayShowTime >= 1500))
   {
-    tft.fillRect(100, 110, 140, 20, TFT_BLACK);
     overlayActive = false;
+    // The overlay sits on top of the temperature, so repaint instead of blanking.
+    drawInterface();
   }
 
   if (currentState != lastButtonState)
@@ -1050,8 +1046,13 @@ void handleButton()
         overlayMessage[sizeof(overlayMessage) - 1] = '\0';
         showOverlay(overlayMessage, TFT_YELLOW);
 
-        getWeatherData();
-        updateWeatherDisplay();
+        if (radioEnable())
+        {
+          getWeatherData();
+          updateWeatherDisplay();
+        }
+        radioDisable();
+        lastWeatherUpdate = millis();
 
         buttonHandled = true;
       }
@@ -1073,7 +1074,6 @@ void handleButton()
         currentBrightnessIndex = (currentBrightnessIndex + 1) % 6;
         uint8_t newBrightness = brightnessLevels[currentBrightnessIndex];
         setBacklightPercent(newBrightness);
-        manualBrightnessSet = true;
 
         Serial.printf("Long press - brightness changed to %d%%\n", newBrightness);
 

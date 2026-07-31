@@ -66,7 +66,17 @@ char location_str[64];
 // ======================== LAYOUT ========================
 #define SCREEN_W 480
 #define SCREEN_H 320
-#define STATS_X 310 // Right-hand stats column
+#define INFO_X 105  // Left block: temperature / feels-like / description
+#define STATS_X 305 // Right block: humidity / pressure / wind
+#define COMPASS_CX 432
+#define COMPASS_CY 150
+#define COMPASS_R 24
+
+// ======================== POWER SAVING ========================
+// ESP32-S3 supports 240/160/80 MHz; APB stays at 80 MHz for all three, so the
+// 80 MHz display SPI and Wi-Fi are unaffected. Below 80 MHz APB drops too.
+#define CPU_FREQ_MHZ 80
+#define LOOP_IDLE_MS 250
 
 // ======================== LGFX CONFIGURATION (identical panel/bus to dashboard_digital.ino) ========================
 class LGFX : public lgfx::LGFX_Device
@@ -152,6 +162,12 @@ long localEpochNow()
   return (long)timeClient.getEpochTime();
 }
 
+// NTP has never landed if the epoch is still counting up from zero.
+bool timeIsValid()
+{
+  return localEpochNow() > 1000000L;
+}
+
 void getLocalTm(struct tm &out)
 {
   time_t rawtime = (time_t)localEpochNow();
@@ -173,6 +189,8 @@ char weather_desc[64] = "--";
 long timezone_offset = 0;
 bool dataValid = false;
 char lastUpdateTime[6] = "--:--";
+char sunriseTime[6] = "--:--";
+char sunsetTime[6] = "--:--";
 
 unsigned long lastWeatherUpdate = 0;
 const unsigned long weatherInterval = 900000UL; // 15 minutes
@@ -199,10 +217,18 @@ void copyStr(char *dst, size_t len, const char *src)
   dst[len - 1] = '\0';
 }
 
-const char *windCompass(int deg)
+// Formats a UTC unix timestamp as local HH:MM using the location's offset.
+void formatLocalHM(long epochUtc, char *out, size_t len)
 {
-  static const char *dirs[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
-  return dirs[((int)((deg / 45.0) + 0.5)) % 8];
+  if (epochUtc <= 0)
+  {
+    copyStr(out, len, "--:--");
+    return;
+  }
+  time_t t = (time_t)(epochUtc + timezone_offset);
+  struct tm tmv;
+  gmtime_r(&t, &tmv);
+  snprintf(out, len, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
 }
 
 // Three-layer VFD glow effect: outer glow, inner glow, core (bright text on top)
@@ -338,6 +364,44 @@ void drawWeatherIcon(int cx, int cy, const char *type, int size)
 
 // ======================== NETWORK FETCH ========================
 #define HTTP_TIMEOUT_MS 8000
+#define WIFI_CONNECT_TIMEOUT_MS 20000
+
+bool radioOn = false;
+
+// The radio is the dominant consumer, so it is only powered for the few seconds
+// per interval that we actually need it.
+bool radioEnable()
+{
+  if (radioOn && WiFi.status() == WL_CONNECTED)
+    return true;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(WIFI_PS_MIN_MODEM);
+  WiFi.begin(wifi_ssid, wifi_password);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_CONNECT_TIMEOUT_MS)
+  {
+    delay(200);
+    esp_task_wdt_reset();
+  }
+
+  radioOn = (WiFi.status() == WL_CONNECTED);
+  if (radioOn)
+    timeClient.begin();
+  else
+    Serial.println("WiFi connect failed");
+  return radioOn;
+}
+
+void radioDisable()
+{
+  // The UDP socket does not survive the interface going down; re-opened by radioEnable().
+  timeClient.end();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  radioOn = false;
+}
 
 void buildApiUrl(char *out, size_t len, const char *endpoint, const char *extraParams)
 {
@@ -407,10 +471,13 @@ void getWeatherData()
   timezone_offset = doc["timezone"] | 0;
   dataValid = true;
 
-  timeClient.setTimeOffset(timezone_offset);
-  timeClient.update();
+  formatLocalHM(doc["sys"]["sunrise"] | 0L, sunriseTime, sizeof(sunriseTime));
+  formatLocalHM(doc["sys"]["sunset"] | 0L, sunsetTime, sizeof(sunsetTime));
 
-  if (localEpochNow() > 1000000)
+  // setTimeOffset applies immediately to getEpochTime(); no NTP round-trip needed.
+  timeClient.setTimeOffset(timezone_offset);
+
+  if (timeIsValid())
   {
     snprintf(lastUpdateTime, sizeof(lastUpdateTime), "%02d:%02d", timeClient.getHours(), timeClient.getMinutes());
   }
@@ -420,6 +487,10 @@ void getWeatherData()
 
 void getForecastData()
 {
+  // Day bucketing is relative to "today", so a bogus clock would silently drop every entry.
+  if (!timeIsValid())
+    return;
+
   // cnt=16 -> 48h of 3h-step data, enough to cover "tomorrow" + "day after tomorrow"
   char url[280];
   buildApiUrl(url, sizeof(url), "forecast", "&cnt=16");
@@ -522,6 +593,29 @@ void drawHeader()
   sprite.setTextDatum(top_left);
 }
 
+void drawSunEvent(int cx, int cy, bool rising, const char *hhmm)
+{
+  const int r = 8;
+
+  sprite.fillCircle(cx, cy, r, COLOR_VFD_GLOW);
+  sprite.drawCircle(cx, cy, r, COLOR_YELLOW);
+  // Clip to a half-sun sitting on the horizon line.
+  sprite.fillRect(cx - r - 1, cy + 1, 2 * r + 3, r + 2, COLOR_BG);
+  sprite.drawFastHLine(cx - r - 5, cy, 2 * r + 11, COLOR_YELLOW);
+
+  int ay = cy - r - 4;
+  if (rising)
+    sprite.fillTriangle(cx + r + 8, ay, cx + r + 4, ay + 6, cx + r + 12, ay + 6, COLOR_YELLOW);
+  else
+    sprite.fillTriangle(cx + r + 8, ay + 6, cx + r + 4, ay, cx + r + 12, ay, COLOR_YELLOW);
+
+  sprite.setTextSize(1);
+  sprite.setTextColor(COLOR_GHOST);
+  sprite.setTextDatum(top_center);
+  sprite.drawString(hhmm, cx, cy + 5);
+  sprite.setTextDatum(top_left);
+}
+
 void drawClock()
 {
   char hh[3], mm[3];
@@ -542,6 +636,9 @@ void drawClock()
 
   sprite.setFont(nullptr);
   sprite.setTextDatum(top_left);
+
+  drawSunEvent(90, 46, true, sunriseTime);
+  drawSunEvent(380, 46, false, sunsetTime);
 }
 
 void drawStat(int x, int y, const char *label, const char *value)
@@ -554,36 +651,80 @@ void drawStat(int x, int y, const char *label, const char *value)
   sprite.drawString(value, x, y + 13);
 }
 
+void drawWindCompass(int cx, int cy, int deg)
+{
+  sprite.drawCircle(cx, cy, COMPASS_R, COLOR_VFD_GLOW);
+  sprite.drawCircle(cx, cy, COMPASS_R - 4, COLOR_VFD_GLOW);
+
+  sprite.setTextSize(1);
+  sprite.setTextColor(COLOR_GHOST);
+  sprite.setTextDatum(middle_center);
+  sprite.drawString("N", cx, cy - COMPASS_R - 7);
+  sprite.drawString("S", cx, cy + COMPASS_R + 7);
+  sprite.drawString("E", cx + COMPASS_R + 7, cy);
+  sprite.drawString("W", cx - COMPASS_R - 7, cy);
+  sprite.setTextDatum(top_left);
+
+  // OpenWeather reports the bearing the wind comes FROM; the arrow shows where it blows TO.
+  float rad = deg * PI / 180.0;
+  float dx = -sin(rad);
+  float dy = cos(rad);
+
+  int tipX = cx + (int)(dx * COMPASS_R * 0.78);
+  int tipY = cy + (int)(dy * COMPASS_R * 0.78);
+  int tailX = cx - (int)(dx * COMPASS_R * 0.6);
+  int tailY = cy - (int)(dy * COMPASS_R * 0.6);
+
+  int headLen = COMPASS_R / 3;
+  int headW = COMPASS_R / 5;
+  float px = -dy;
+  float py = dx;
+
+  int h1x = tipX + (int)(-dx * headLen + px * headW);
+  int h1y = tipY + (int)(-dy * headLen + py * headW);
+  int h2x = tipX + (int)(-dx * headLen - px * headW);
+  int h2y = tipY + (int)(-dy * headLen - py * headW);
+
+  sprite.drawLine(tailX, tailY, tipX, tipY, COLOR_VFD_MAIN);
+  sprite.fillTriangle(tipX, tipY, h1x, h1y, h2x, h2y, COLOR_VFD_MAIN);
+  sprite.fillCircle(cx, cy, 2, COLOR_VFD_MAIN);
+}
+
 void drawCurrentWeather()
 {
-  drawWeatherIcon(60, 150, weather_main, 40);
+  drawWeatherIcon(55, 130, weather_main, 38);
 
   sprite.setFont(nullptr);
   // Size 5 keeps the widest reading ("-12.3C") clear of the stats column at STATS_X.
   sprite.setTextSize(5);
   char tempStr[12];
   snprintf(tempStr, sizeof(tempStr), "%.1fC", temp_c);
-  drawVFDText(tempStr, 115, 100, COLOR_VFD_MAIN);
+  drawVFDText(tempStr, INFO_X, 105, COLOR_VFD_MAIN);
 
   sprite.setTextSize(2);
   sprite.setTextColor(COLOR_GHOST);
-  char feelsStr[24];
-  snprintf(feelsStr, sizeof(feelsStr), "FEELS LIKE %.1fC", feels_like);
-  sprite.drawString(feelsStr, 115, 150);
+  char feelsStr[20];
+  snprintf(feelsStr, sizeof(feelsStr), "FEELS %.1fC", feels_like);
+  sprite.drawString(feelsStr, INFO_X, 152);
 
-  sprite.setTextSize(strlen(weather_desc) > 26 ? 1 : 2);
+  // The left block is 195px wide: 16 chars at size 2, 32 at size 1.
+  char descStr[33];
+  copyStr(descStr, sizeof(descStr), weather_desc);
+  sprite.setTextSize(strlen(descStr) > 16 ? 1 : 2);
   sprite.setTextColor(COLOR_VFD_MAIN);
-  sprite.drawString(weather_desc, 115, 178);
+  sprite.drawString(descStr, INFO_X, 178);
 
-  char buf[24];
-  snprintf(buf, sizeof(buf), "%d%%", humidity);
-  drawStat(STATS_X, 95, "HUMIDITY", buf);
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d", humidity);
+  drawStat(STATS_X, 95, "HUMIDITY %", buf);
 
-  snprintf(buf, sizeof(buf), "%.1f KM/H %s", wind_speed_ms * 3.6, windCompass(wind_deg));
-  drawStat(STATS_X, 140, "WIND", buf);
+  snprintf(buf, sizeof(buf), "%d", (int)(pressure_hpa * 0.75006));
+  drawStat(STATS_X, 140, "PRESSURE MMHG", buf);
 
-  snprintf(buf, sizeof(buf), "%d MMHG", (int)(pressure_hpa * 0.75006));
-  drawStat(STATS_X, 185, "PRESSURE", buf);
+  snprintf(buf, sizeof(buf), "%.1f", wind_speed_ms * 3.6);
+  drawStat(STATS_X, 185, "WIND KM/H", buf);
+
+  drawWindCompass(COMPASS_CX, COMPASS_CY, wind_deg);
 }
 
 void drawForecastCard(int x, int y, int w, int h, DayForecast &d)
@@ -592,29 +733,34 @@ void drawForecastCard(int x, int y, int w, int h, DayForecast &d)
 
   sprite.setFont(nullptr);
   sprite.setTextSize(2);
-  drawVFDText(d.valid ? d.label : "N/A", x + 10, y + 8, COLOR_VFD_MAIN);
+  drawVFDText(d.valid ? d.label : "N/A", x + 10, y + 4, COLOR_VFD_MAIN);
 
   if (!d.valid)
     return;
 
-  drawWeatherIcon(x + 35, y + 44, d.main, 22);
+  drawWeatherIcon(x + 35, y + 42, d.main, 22);
+
+  sprite.setTextSize(1);
+  sprite.setTextColor(COLOR_GHOST);
+  sprite.drawString("MAX", x + 70, y + 26);
+  sprite.drawString("MIN", x + 130, y + 26);
 
   sprite.setTextSize(2);
   sprite.setTextColor(COLOR_YELLOW);
   char maxStr[8];
   snprintf(maxStr, sizeof(maxStr), "%.0fC", d.tempMax);
-  sprite.drawString(maxStr, x + 70, y + 26);
+  sprite.drawString(maxStr, x + 70, y + 36);
 
   sprite.setTextColor(COLOR_VFD_MAIN);
   char minStr[8];
   snprintf(minStr, sizeof(minStr), "%.0fC", d.tempMin);
-  sprite.drawString(minStr, x + 130, y + 26);
+  sprite.drawString(minStr, x + 130, y + 36);
 
   sprite.setTextSize(1);
   sprite.setTextColor(d.pop >= 30 ? COLOR_BLUE : COLOR_GHOST);
   char popStr[16];
   snprintf(popStr, sizeof(popStr), "RAIN %d%%", d.pop);
-  sprite.drawString(popStr, x + 70, y + 52);
+  sprite.drawString(popStr, x + 150, y + 54);
 }
 
 void drawForecastPanel()
@@ -641,8 +787,8 @@ void drawScreen()
   sprite.pushSprite(0, 0);
 }
 
-// Night backlight mode (23:00 - 07:00 -> 2%, otherwise 30%)
-#define BRIGHTNESS_NIGHT 2
+// Night backlight mode (23:00 - 07:00 -> 1%, otherwise 30%)
+#define BRIGHTNESS_NIGHT 1
 #define BRIGHTNESS_DAY 30
 
 void updateBacklightMode()
@@ -665,6 +811,10 @@ void setup()
   delay(300);
   Serial.println("\n=== Weather Station v2 (Neon) ===");
 
+  setCpuFrequencyMhz(CPU_FREQ_MHZ);
+  // The radio reconnects every interval; without this every begin() may hit NVS.
+  WiFi.persistent(false);
+
   esp_task_wdt_init(WDT_TIMEOUT, true);
   esp_task_wdt_add(NULL);
 
@@ -680,31 +830,25 @@ void setup()
   if (!sprite.createSprite(SCREEN_W, SCREEN_H))
   {
     Serial.println("ERROR: Sprite creation failed!");
+    lcd.setTextColor(COLOR_PEAK_RED);
+    lcd.setTextDatum(middle_center);
+    lcd.setTextSize(2);
+    lcd.drawString("SPRITE ALLOC FAILED", SCREEN_W / 2, SCREEN_H / 2);
     while (1)
+    {
+      esp_task_wdt_reset();
       delay(1000);
+    }
   }
 
   copyStr(location_str, sizeof(location_str), city);
 
   drawBootScreen("CONNECTING WIFI...");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifi_ssid, wifi_password);
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart) < 20000)
-  {
-    delay(200);
-    esp_task_wdt_reset();
-  }
+  radioEnable();
 
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    Serial.println("WiFi connection failed - continuing in degraded mode");
-  }
-
-  timeClient.begin();
   drawBootScreen("SYNCING TIME...");
   unsigned long timeStart = millis();
-  while (localEpochNow() < 1000000 && (millis() - timeStart) < 10000)
+  while (!timeIsValid() && (millis() - timeStart) < 10000)
   {
     timeClient.update();
     delay(200);
@@ -726,6 +870,7 @@ void setup()
 
   getForecastData();
   esp_task_wdt_reset();
+  radioDisable();
 
   lastWeatherUpdate = millis();
   lastForecastUpdate = millis();
@@ -738,29 +883,41 @@ void setup()
 void loop()
 {
   esp_task_wdt_reset();
-  timeClient.update();
 
   unsigned long now = millis();
   bool needsRedraw = false;
 
-  if (now - lastWeatherUpdate >= weatherInterval)
-  {
-    getWeatherData();
-    lastWeatherUpdate = now;
-    needsRedraw = true;
-  }
+  bool weatherDue = (now - lastWeatherUpdate >= weatherInterval);
+  bool forecastDue = (now - lastForecastUpdate >= forecastInterval);
+  // Until the clock is set, retry NTP at the short interval instead of waiting a day.
+  bool ntpDue = (now - lastNTPSync >= (timeIsValid() ? ntpSyncInterval : weatherInterval));
 
-  if (now - lastForecastUpdate >= forecastInterval)
+  // All network work is batched into a single radio window per interval.
+  if (weatherDue || forecastDue || ntpDue)
   {
-    getForecastData();
-    lastForecastUpdate = now;
-    needsRedraw = true;
-  }
+    if (radioEnable())
+    {
+      // Each step can block for seconds, so the watchdog is fed between them.
+      if (ntpDue)
+        timeClient.forceUpdate();
+      esp_task_wdt_reset();
+      if (weatherDue)
+        getWeatherData();
+      esp_task_wdt_reset();
+      if (forecastDue)
+        getForecastData();
+      esp_task_wdt_reset();
+    }
+    radioDisable();
 
-  if (now - lastNTPSync >= ntpSyncInterval)
-  {
-    timeClient.forceUpdate();
-    lastNTPSync = now;
+    // Timestamps advance even on failure so a dead link is not retried every loop.
+    if (weatherDue)
+      lastWeatherUpdate = now;
+    if (forecastDue)
+      lastForecastUpdate = now;
+    if (ntpDue)
+      lastNTPSync = now;
+    needsRedraw = true;
   }
 
   static char lastMinute[6] = "";
@@ -776,4 +933,6 @@ void loop()
 
   if (needsRedraw)
     drawScreen();
+
+  delay(LOOP_IDLE_MS);
 }

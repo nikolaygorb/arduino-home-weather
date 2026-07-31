@@ -46,7 +46,16 @@ What it does
   min/max temperature, rain probability and a representative condition icon.
 - Neon/VFD-style rendering (glow text, full-screen sprite buffer) matching the look of
   `arduino-simdash/dashboard_digital.ino`.
-- No physical button; brightness is set automatically by time of day (2% at night, 30% by day).
+- Vector compass rose with a wind-direction arrow, plus sunrise/sunset times beside the clock.
+- No physical button; brightness is set automatically by time of day (1% at night, 30% by day).
+
+Power saving
+- CPU clocked down to 80 MHz. This is the floor: the ESP32-S3 supports 240/160/80 MHz and the
+  APB bus stays at 80 MHz for all three, so the 80 MHz display SPI and Wi-Fi are unaffected.
+- The radio is off by default. It is powered up only for a short window when weather, forecast
+  or NTP data is due, then shut down again (`WiFi.disconnect(true)` + `WIFI_OFF`).
+- Modem sleep (`WIFI_PS_MIN_MODEM`) while the radio is up.
+- The clock keeps running from the local `millis()` offset, so no network is needed between syncs.
 
 Configuration
 - Reuses the same `API_KEY` from `secrets.h`.
